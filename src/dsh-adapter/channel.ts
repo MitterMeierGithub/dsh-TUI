@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { assembleContextFor, installModelSelection, type Agent, type AgentHandle, type AgentStatus, type CreateAgentOptions, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import type { CommandExecution, CommandRuntime } from '@deepseek-ai/dsh-commands'
-import { isUserInvocable, renderSkillContent, type SkillSummary } from '@deepseek-ai/dsh-skill'
+import { isModelInvocable, isUserInvocable, renderSkillContent, type SkillSummary } from '@deepseek-ai/dsh-skill'
 import type { LlmConfigurableProvider, LlmDiscoveredModel, LlmModelInfo, LlmProviderInfo } from '@deepseek-ai/dsh-llm'
 import {
   createUserMessage,
@@ -13,6 +13,7 @@ import {
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { runSideQuestion, wrapSideQuestion } from './sideQuestion.js'
+import { isReservedCredentialRef } from './credentialRefGuard.js'
 import { collectRecentActivity, parseRecapResponse, RECAP_RECENT_CHARS, wrapRecapPrompt, type RecapOutcome } from './recap.js'
 import { SESSION_COLOR_NAMES } from '../cc/sessionColors.js'
 import { fetchBalance, type BalanceResult } from '../deepseekBalance.js'
@@ -26,7 +27,7 @@ import { renderContextSections, renderPrompt } from '@deepseek-ai/dsh-system-pro
 import { loadBaselineInstructions } from '@deepseek-ai/dsh-agent-instructions'
 import type { Context } from '@deepseek-ai/cordis'
 import { extname, isAbsolute, join } from 'node:path'
-import { completeCommands, HIDDEN_COMMAND_NAMES, isLocalCommandName, LOCAL_COMMANDS, parseCommandName, type CommandCompletion, type CommandCompletionNode, type LocalCommand } from '../commands.js'
+import { completeCommands, HIDDEN_COMMAND_NAMES, isCommandCompletionToken, isLocalCommandName, LOCAL_COMMANDS, parseCommandName, type CommandCompletion, type CommandCompletionNode, type LocalCommand } from '../commands.js'
 import { clearResumeTarget, forgetSession, readResumeTarget, touchSession, writeResumeTarget } from '../sessionHistory.js'
 import { appendSessionTitle, defaultMaxScanned, deleteSessionLog, ensureLegacySessionEventTypes, readSessionEventsFromFile, readSessionEventsFromLog, sessionsRoots } from './compat/index.js'
 import {
@@ -64,8 +65,8 @@ import { logForDebugging } from '../utils/debug.js'
 import { homeDir, LEGACY_DATA_DIR } from '../utils/paths.js'
 import { extractMentions } from '../utils/mentions.js'
 import { getLang, LANGS, t } from '../i18n.js'
-import { AUTO_THEME_NAME, THEME_NAMES } from '../theme.js'
-import { listCustomThemes } from '../customTheme.js'
+import { AUTO_THEME_NAME } from '../theme.js'
+import { listThemeCatalog } from '../themeCatalog.js'
 import { modeDisplayName, resolveSessionModes, type SessionModeSpec } from '../sessionModes.js'
 import { normalizeScrollGutter, normalizeStatusBar, normalizeToolBackground, type ScrollGutterMode, type StatusBarConfig, type ToolBackground } from '../tuiDisplayPrefs.js'
 import { SubagentActivityStore, type SubagentState } from './subagents.js'
@@ -83,6 +84,7 @@ import { getHostSettingsSections, getLocalSettingsSectionsHost, type TuiSettings
 import type { SettingsHost } from './settingsEditor.js'
 import { getHostSceneRuntime, type TuiSceneDescriptor, type TuiSceneRuntime } from './scenes.js'
 import { getHostRenderers, type TuiRendererRuntime } from './renderers.js'
+import { getHostThemes, type TuiThemeRuntime } from './themes.js'
 import { getHostMessageObserver, type TuiMessageObserverRuntime } from './message-observer.js'
 import { dispatchTuiDecision, dispatchTuiNotification, normalizeCancelDecision } from './extension-events.js'
 import { installDecisionGuard } from './decision-guard.js'
@@ -178,6 +180,131 @@ function normalizeRewindPromptDecision(
 /** Toast-bound plugin text (veto reasons, handled notices, rewind summaries)
  *  is render-path data too: same sanitization, toast-width cap. */
 const NOTICE_CELLS = 200
+
+const PERMISSION_PRESET_CUSTOM = 'custom'
+const PERMISSION_PRESET_NAME_CELLS = 120
+const PERMISSION_PRESET_DESCRIPTION_CELLS = 400
+
+type PermissionPresetService = {
+  names?: unknown
+  current?: (events: readonly SessionEvent[]) => unknown
+  optionOf?: (name: string) => unknown
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object'
+}
+
+function legacyPermissionPresetOptions(): readonly PermissionPresetOption[] {
+  return [
+    {
+      value: 'read-only',
+      name: t('permission-preset-readonly'),
+      description: t('permission-preset-readonly-desc'),
+    },
+    {
+      value: 'workspace-write',
+      name: t('permission-preset-workspace-write'),
+      description: t('permission-preset-workspace-write-desc'),
+    },
+    {
+      value: 'danger-full-access',
+      name: t('permission-preset-full-access'),
+      description: t('permission-preset-full-access-desc'),
+    },
+  ]
+}
+
+function legacyPermissionPresetSnapshot(sandbox: SessionModeSpec['sandbox']): PermissionPresetSnapshot {
+  const options = legacyPermissionPresetOptions()
+  const currentOption = sandbox === undefined ? undefined : options.find(option => option.value === sandbox)
+  return {
+    availability: 'legacy',
+    options,
+    ...(currentOption === undefined
+      ? {}
+      : { current: { ...currentOption, kind: 'preset' as const } }),
+  }
+}
+
+function unavailablePermissionPresetSnapshot(): PermissionPresetSnapshot {
+  return { availability: 'unavailable', options: [] }
+}
+
+function normalizePermissionPresetOption(value: unknown): PermissionPresetOption | undefined {
+  if (!isRecord(value) || typeof value.value !== 'string' || typeof value.name !== 'string') return undefined
+  const name = cleanRenderText(value.name, PERMISSION_PRESET_NAME_CELLS)
+  if (name === '') return undefined
+  if (value.description !== undefined && typeof value.description !== 'string') return undefined
+  const description = value.description === undefined
+    ? undefined
+    : cleanRenderText(value.description, PERMISSION_PRESET_DESCRIPTION_CELLS)
+  if (value.description !== undefined && description === '') return undefined
+  return {
+    value: value.value,
+    name,
+    ...(description === undefined || description === '' ? {} : { description }),
+  }
+}
+
+function permissionPresetSnapshotFromService(
+  service: unknown,
+  events: readonly SessionEvent[],
+): PermissionPresetSnapshot {
+  if (!isRecord(service)) return unavailablePermissionPresetSnapshot()
+  const runtime = service as PermissionPresetService
+  try {
+    const capturedNames = runtime.names
+    const current = runtime.current
+    const optionOf = runtime.optionOf
+    if (!Array.isArray(capturedNames) || capturedNames.length === 0) return unavailablePermissionPresetSnapshot()
+    if (typeof current !== 'function' || typeof optionOf !== 'function') return unavailablePermissionPresetSnapshot()
+
+    const names = [...capturedNames]
+    const seen = new Set<string>()
+    for (const name of names) {
+      if (typeof name !== 'string' || name.trim() === '' || name === PERMISSION_PRESET_CUSTOM || seen.has(name)) {
+        return unavailablePermissionPresetSnapshot()
+      }
+      seen.add(name)
+    }
+
+    const options: PermissionPresetOption[] = []
+    for (const name of names) {
+      const option = normalizePermissionPresetOption(optionOf(name))
+      if (option === undefined || option.value !== name) return unavailablePermissionPresetSnapshot()
+      options.push({ ...option })
+    }
+
+    const currentValue = current(events)
+    if (typeof currentValue !== 'string' || (currentValue !== PERMISSION_PRESET_CUSTOM && !seen.has(currentValue))) {
+      return unavailablePermissionPresetSnapshot()
+    }
+    const currentOption = normalizePermissionPresetOption(optionOf(currentValue))
+    if (currentOption === undefined || currentOption.value !== currentValue) return unavailablePermissionPresetSnapshot()
+    if (currentValue !== PERMISSION_PRESET_CUSTOM) {
+      const rosterOption = options.find(option => option.value === currentValue)
+      if (
+        rosterOption === undefined
+        || rosterOption.name !== currentOption.name
+        || rosterOption.description !== currentOption.description
+      ) {
+        return unavailablePermissionPresetSnapshot()
+      }
+    }
+
+    return {
+      availability: 'runtime',
+      options,
+      current: {
+        ...currentOption,
+        kind: currentValue === PERMISSION_PRESET_CUSTOM ? 'custom' : 'preset',
+      },
+    }
+  } catch {
+    return unavailablePermissionPresetSnapshot()
+  }
+}
 
 /** `tui/rewind-done` return normalization: the first non-empty STRING is the
  *  summary; anything else is not a decision. */
@@ -522,6 +649,8 @@ export interface Channel {
    *  the prompt-input border + session label chip accent (cc/sessionColors). */
   readonly sessionColor: string
   readonly agentId: string
+  /** TUI-owned generation that changes on every live Agent rebind. */
+  readonly agentBindingGeneration: number
   /** `dsh-tui.recapOnOpen` (default on): auto-summarize the session tail
    *  into the dim AutoRecapRow when the session opens/resumes. Read live
    *  (settings service), so a `/settings` change applies on the next
@@ -606,6 +735,10 @@ export interface Channel {
   /** Whether the session-name chip shows on the prompt top border's right
    *  side (settings `dsh-tui.promptSessionLabel`; off by default). */
   readonly promptSessionLabel: boolean
+  /** Whether the fullscreen draft editor is enabled (settings
+   *  `dsh-tui.expandEditor`; on by default) — gates the ⛶ affordance and
+   *  the expandEditor shortcut. */
+  readonly expandEditor: boolean
   /** Live status-footer visibility and compactness preferences. */
   readonly statusBar: Readonly<StatusBarConfig>
   /** Whether the header's pixel whale art shows (settings `dsh-tui.whale`). */
@@ -781,6 +914,8 @@ export interface Channel {
   readonly modeIndex: number
   /** Shift+Tab: advance to the next configured session mode. */
   cycleMode(): Promise<void>
+  /** Read the official permission preset roster and current identity. */
+  permissionPresets(): PermissionPresetSnapshot
   /** The preset the CURRENT session runs under (issue #8), resolved from its
    *  log at create/resume time; undefined when no roster is mounted. */
   readonly agentPreset: string | undefined
@@ -928,6 +1063,31 @@ export interface PresetOption {
   isDefault: boolean
 }
 
+export type PermissionPresetAvailability = 'runtime' | 'legacy' | 'unavailable'
+
+export interface PermissionPresetOption {
+  readonly value: string
+  readonly name: string
+  readonly description?: string
+}
+
+export interface PermissionPresetCurrent {
+  readonly value: string
+  readonly name: string
+  readonly description?: string
+  readonly kind: 'preset' | 'custom'
+}
+
+/**
+ * Adapter-owned permission roster snapshot. `options` never contains the
+ * official `custom` sentinel; it is represented only by `current`.
+ */
+export interface PermissionPresetSnapshot {
+  readonly availability: PermissionPresetAvailability
+  readonly options: readonly PermissionPresetOption[]
+  readonly current?: PermissionPresetCurrent
+}
+
 /** @internal */
 /** One user message submitted while the model was working, not yet claimed
  *  by a turn. `steer` lands at the next step boundary of the running turn;
@@ -959,6 +1119,8 @@ export interface ChannelState {
   sessionColor: string
   autoRecapOnOpen: boolean
   agentId: string
+  /** TUI-owned generation that changes on every live Agent rebind. */
+  agentBindingGeneration: number
   model: string
   provider: string
   tokens: TokenUsage
@@ -1010,6 +1172,8 @@ export interface ChannelState {
   foldTerminalCommand: boolean
   /** Session-name chip on the prompt border (see the public Channel type). */
   promptSessionLabel: boolean
+  /** Fullscreen draft editor gate (see the public Channel type). */
+  expandEditor: boolean
   /** Status-footer preferences (see the public Channel type). */
   statusBar: StatusBarConfig
   /** Apply a diff-layout change (see the public Channel type). */
@@ -1024,6 +1188,8 @@ export interface ChannelState {
   setFoldTerminalCommand(enabled: boolean): void
   /** Apply a prompt session-name chip change. */
   setPromptSessionLabel(enabled: boolean): void
+  /** Apply a fullscreen-editor gate change. */
+  setExpandEditor(enabled: boolean): void
   /** Apply status-footer preference changes. */
   setStatusBar(config: Partial<StatusBarConfig>): void
   /** Whale header art switch (see the public Channel type). */
@@ -1125,6 +1291,8 @@ export interface ChannelState {
   modeIndex: number
   /** Shift+Tab session-mode advance (see the public Channel type). */
   cycleMode(): Promise<void>
+  /** Read the official permission preset roster and current identity. */
+  permissionPresets(): PermissionPresetSnapshot
   /** The preset the current session runs under (see the public Channel type). */
   agentPreset: string | undefined
   /** The roster's presets for the `/preset` picker (see the public Channel type). */
@@ -1556,6 +1724,9 @@ export function createChannel(
     /** Session-name chip on the prompt top border; default off (settings
      *  `dsh-tui.promptSessionLabel`). */
     promptSessionLabel?: boolean
+    /** Fullscreen draft editor entry points; default on (settings
+     *  `dsh-tui.expandEditor`). */
+    expandEditor?: boolean
     /** Status-footer field visibility and compactness. */
     statusBar?: Partial<StatusBarConfig>
     /** Show the header's pixel whale art; default on. */
@@ -1591,6 +1762,7 @@ export function createChannel(
 ): ChannelState {
   let agent = initialAgent
   let currentHandle: AgentHandle | undefined = options.handle
+  const themeHost = getHostThemes(ctx.get('tuiThemes') as TuiThemeRuntime | undefined)
   const subagentControl: SubagentControl = {
     interrupt(agentId) {
       const child = subagentStore.get(agentId)
@@ -2335,7 +2507,7 @@ export function createChannel(
       }
       // `undefined` = not registered; a handler error surfaces as its
       // message so the user sees why the command failed.
-      return execution?.result.text ?? ''
+      return execution === undefined ? undefined : execution.result.text ?? ''
     } catch (error) {
       return error instanceof Error ? error.message : String(error)
     }
@@ -2561,6 +2733,42 @@ export function createChannel(
     }).catch(() => {})
   }
 
+  // --- Manual-compaction lifecycle ---------------------------------------
+  // The in-flight /compact transaction: its abort hook plus the settled
+  // promise. Every path that replaces `agent` (rewind / rewind-node /
+  // resume / new / model switch) must cancel and await it BEFORE snapshot-
+  // ting the session. Without this, a slow summarizer keeps running against
+  // the OLD session across the switch and can commit its replacement
+  // checkpoint AFTER the fork snapshot — silently swapping the history the
+  // user believed intact ("compaction failed → /model → context lost").
+  let manualCompaction:
+    | { controller: AbortController; settled: Promise<void> }
+    | undefined
+  /** Compactions cancelled by settleManualCompaction: their rejection is expected. */
+  const cancelledCompactions = new WeakSet<AbortController>()
+
+  /**
+   * Cancel an in-flight manual compaction and wait for it to settle.
+   * Aborting tears the summarizer stream down; dsh-compaction then closes
+   * the transaction with an error end marker and rejects compactNow with
+   * the `cancelled` class — no checkpoint is committed, the surface stays
+   * whole. The settle race is capped so a stuck stream can never wedge the
+   * session switch itself.
+   */
+  const settleManualCompaction = async (): Promise<void> => {
+    const active = manualCompaction
+    if (active === undefined) return
+    manualCompaction = undefined
+    cancelledCompactions.add(active.controller)
+    active.controller.abort(new Error('session switch'))
+    state.notify(t('compact-cancelled-switch'), { color: 'warning', timeoutMs: 4000 })
+    await Promise.race([
+      active.settled,
+      new Promise<void>(resolve => { setTimeout(resolve, 3000) }),
+    ])
+  }
+
+  let agentBindingGeneration = 0
   const state: ChannelState = {
     effortLevels: undefined,
     version: 0,
@@ -2580,6 +2788,7 @@ export function createChannel(
       return (ns?.value as Record<string, unknown> | undefined)?.recapOnOpen !== false
     },
     agentId: agent.id,
+    agentBindingGeneration: 0,
     model: options.model,
     provider: options.provider,
     tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, peak: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, idle: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
@@ -2615,6 +2824,7 @@ export function createChannel(
     scrollGutter: normalizeScrollGutter(options.scrollGutter),
     foldTerminalCommand: options.foldTerminalCommand === true,
     promptSessionLabel: options.promptSessionLabel === true,
+    expandEditor: options.expandEditor !== false,
     statusBar: normalizeStatusBar(options.statusBar),
     whale: options.whale !== false,
     minimal: options.minimal === true,
@@ -2654,21 +2864,34 @@ export function createChannel(
           ]
         }
         if (path.length === 1 && path[0] === 'theme') {
+          const themeEntries = listThemeCatalog(themeHost)
           return [
             { name: 'status', description: 'Show the current theme', descriptionKey: 'sugg-status-desc' },
             { name: AUTO_THEME_NAME, description: 'Follow the terminal background', descriptionKey: 'sugg-theme-auto-desc' },
-            ...THEME_NAMES.map((name) => ({
-              name,
-              description: `Built-in theme ${name}`,
-              descriptionKey: 'sugg-theme-builtin-desc',
-            })),
-            ...listCustomThemes()
-              .filter((spec) => spec.name !== AUTO_THEME_NAME)
-              .map((spec) => ({
-                name: spec.name,
-                description: `User theme (${spec.base} base)`,
-                descriptionKey: 'sugg-theme-user-desc',
-              })),
+            ...themeEntries
+              .filter((entry) => entry.name !== AUTO_THEME_NAME)
+              .map((entry) => {
+                const base = entry.base ?? 'dark'
+                if (entry.source === 'builtin') {
+                  return {
+                    name: entry.name,
+                    description: `Built-in theme ${entry.name}`,
+                    descriptionKey: 'sugg-theme-builtin-desc',
+                  }
+                }
+                if (entry.source === 'runtime') {
+                  return {
+                    name: entry.name,
+                    description: `Plugin theme (${base} base)`,
+                    descriptionKey: 'sugg-theme-plugin-desc',
+                  }
+                }
+                return {
+                  name: entry.name,
+                  description: `User theme (${base} base)`,
+                  descriptionKey: 'sugg-theme-user-desc',
+                }
+              }),
           ]
         }
         if (path.length === 1 && path[0] === 'color') {
@@ -2743,13 +2966,23 @@ export function createChannel(
           ]
         }
         if (path.length === 1 && path[0] === 'permission') {
-          // Sandbox-preset vocabulary of the `/permission` picker — Tab
-          // completes it for keyboard users, Enter still dispatches.
-          return [
-            { name: 'read-only', description: 'Read-only session: no file writes, no commands', descriptionKey: 'permission-preset-readonly-desc' },
-            { name: 'workspace-write', description: 'Read/write inside the workspace; writes need a prior read', descriptionKey: 'permission-preset-workspace-write-desc' },
-            { name: 'danger-full-access', description: 'Unrestricted access, no approvals', descriptionKey: 'permission-preset-full-access-desc' },
-          ]
+          const snapshot = state.permissionPresets()
+          return snapshot.options
+            .filter(option => isCommandCompletionToken(option.value))
+            .map(option => ({
+              name: option.value,
+              description: option.description ?? option.name,
+              ...(option.value === 'read-only'
+                ? { descriptionKey: 'permission-preset-readonly-desc' }
+                : option.value === 'workspace-write'
+                  ? { descriptionKey: 'permission-preset-workspace-write-desc' }
+                  : option.value === 'danger-full-access'
+                    ? { descriptionKey: 'permission-preset-full-access-desc' }
+                    : {}),
+              ...(snapshot.current?.kind === 'preset' && snapshot.current.value === option.value
+                ? { tag: 'current' }
+                : {}),
+            }))
         }
         if (path.length === 1 && path[0] === 'plan') {
           return [
@@ -2990,6 +3223,10 @@ export function createChannel(
           return null
         }
       }
+      // An in-flight manual compaction must not straddle the fork: cancel it
+      // and wait, or its checkpoint could commit right after the seed snapshot
+      // below and quietly replace history the rewind was meant to preserve.
+      await settleManualCompaction()
       const childId = SessionId(randomUUID())
       // DSH event order is `turn/start → user/message → … → turn/end`, so a
       // message's own seq always sits inside its turn — forking there would
@@ -3508,6 +3745,10 @@ export function createChannel(
         state.notify(t('rewind-unavailable'), { color: 'error' })
         return null
       }
+      // An in-flight manual compaction must not straddle the snapshot below
+      // (live branch) nor keep summarizing the current session while the
+      // rewind targets another — cancel and await it first.
+      await settleManualCompaction()
       // Pin the entry-time session: the awaits below (log load, preset
       // compose, agent create) are windows in which a queued switch
       // (/new, /resume, /model) can swap `agent` — the mutation queue only
@@ -3695,6 +3936,10 @@ export function createChannel(
         state.notify(t('fork-while-working'), { color: 'warning' })
         return false
       }
+      // An in-flight manual compaction must not straddle the fork snapshot:
+      // cancel and await it, or its checkpoint could commit right after the
+      // seed copy below and quietly replace history the fork preserved.
+      await settleManualCompaction()
       const source = agent.session
       const childId = SessionId(randomUUID())
       // No boundary: the whole (turn-closed) log. Slice via sessions.fork for
@@ -3799,6 +4044,10 @@ export function createChannel(
       // target — a veto leaves the live session and its transcript
       // untouched.
       if (await sessionSwitchVetoed('resume', sessionId)) return { ok: false, reason: 'cancelled' }
+      // The live session's in-flight manual compaction must not keep running
+      // (and commit its checkpoint) once we leave it for the target — cancel
+      // and await it before any target read.
+      await settleManualCompaction()
       let handle: AgentHandle
       // Compat boundary: register vouched-for legacy event types (e.g.
       // activity/status from pre-#143 logs) in every reachable dsh-session
@@ -3968,6 +4217,10 @@ export function createChannel(
       // Plugin veto point (tui/session-switch): no side effects have
       // happened yet — the session id below is not even allocated.
       if (await sessionSwitchVetoed('new')) return false
+      // Leaving the live session: its in-flight manual compaction must not
+      // keep summarizing (and later commit a checkpoint the user believes
+      // cancelled) — cancel and await it first.
+      await settleManualCompaction()
       const sessionId = SessionId(randomUUID())
       let handle: AgentHandle
       // A fresh session composes the caller's DEFAULT preset: the cordis.yml
@@ -4185,6 +4438,11 @@ export function createChannel(
       }
       let seed: readonly SessionEvent[]
       try {
+        // An in-flight manual compaction must not straddle the fork: cancel
+        // it first, or its checkpoint can commit right after this snapshot —
+        // the model-switched child would start from the summary alone while
+        // the user believes the full history carried over ("context lost").
+        await settleManualCompaction()
         // No boundary = fork the whole log (continue the conversation).
         seed = sessions.fork(agent.session).events
       } catch (error) {
@@ -4288,7 +4546,7 @@ export function createChannel(
       currentHandle = handle
       bindAgent()
       // Model-switch quip rides the fresh tracker (pi parity).
-      activityTracker.onModelSwitch(model)
+      updateWorkingActivity('model switch', () => activityTracker.onModelSwitch(model))
       refreshCommandList()
       void refreshLoadedContext()
       void refreshSkillCommands()
@@ -4384,6 +4642,11 @@ export function createChannel(
       state.promptSessionLabel = enabled
       state.emit()
     },
+    setExpandEditor(enabled) {
+      if (enabled === state.expandEditor) return
+      state.expandEditor = enabled
+      state.emit()
+    },
     setStatusBar(config) {
       const next = normalizeStatusBar({ ...state.statusBar, ...config })
       const changed = Object.keys(next).some(key =>
@@ -4423,6 +4686,16 @@ export function createChannel(
       state.emit()
       state.notify(t('activity-indicator-switched', { name }))
       return true
+    },
+    permissionPresets() {
+      let service: unknown
+      try {
+        service = ctx.get('permissionPresets')
+      } catch {
+        return unavailablePermissionPresetSnapshot()
+      }
+      if (service === undefined) return legacyPermissionPresetSnapshot(state.mode.sandbox)
+      return permissionPresetSnapshotFromService(service, agent.session.events)
     },
     async listPresets() {
       const presets = rosterOf(ctx)
@@ -4634,6 +4907,13 @@ export function createChannel(
         },
         async writeCredential(ref, value) {
           if (!credentials) throw new Error('credentials service unavailable')
+          // Second layer of the secret-ref reservation guard: the
+          // registration layer already rejects plugin sections with
+          // host-owned refs, but this seam must not trust it — a stale
+          // section (registered before the guard) or a direct call must not
+          // reach the shared credentials. The host's own main-credential
+          // writes go through providerSetup().writeCredential instead.
+          if (isReservedCredentialRef(ref)) throw new Error(t('settings-secret-ref-reserved', { ref }))
           await credentials.set(ref, value)
         },
       }
@@ -4977,21 +5257,43 @@ export function createChannel(
           state.notify(t('compact-while-working'), { color: 'warning' })
           return
         }
-        const signal = new AbortController().signal
+        const controller = new AbortController()
         state.notify(t('compact-working'))
-        void compactService
-          .compactNow(agent, signal)
-          .then((result) => {
+        // Register the in-flight transaction so any agent-replacing path
+        // (rewind/resume/new/model switch) can cancel it before snapshotting
+        // the session — see settleManualCompaction. `settled` never rejects:
+        // every branch lands in a notification.
+        const settled = (async () => {
+          try {
+            const result = await compactService.compactNow(agent, controller.signal)
             state.notify(result ? t('compact-done') : t('compact-nothing'))
             // Compaction quip rides the next thinking rotation (pi parity).
-            if (result) activityTracker.onCompact('done')
-          })
-          .catch((error: unknown) => {
+            if (result) updateWorkingActivity('compaction', () => activityTracker.onCompact('done'))
+          } catch (error: unknown) {
+            // ManualCompactionError('persistence'): the replacement checkpoint
+            // is ALREADY committed — only the durability flush failed. The
+            // surface is now the summary, so a plain "failed" toast here sent
+            // users to /model expecting full history and finding only the
+            // summary ("context lost"). Distinguish it, structurally — the
+            // TUI must not import the error class across the adapter seam.
+            if ((error as { code?: unknown }).code === 'persistence') {
+              state.notify(t('compact-flush-failed'), { color: 'warning', timeoutMs: 12000 })
+              return
+            }
+            // A switch-initiated abort rejects compactNow with the abort reason;
+            // the cancellation was already toasted above — a second generic
+            // "failed" toast for the same, expected rejection would mislead.
+            if (cancelledCompactions.has(controller)) return
             state.notify(
               t('compact-failed', { err: error instanceof Error ? error.message : String(error) }),
               { color: 'error', timeoutMs: 8000 },
             )
-          })
+          }
+        })()
+        manualCompaction = { controller, settled }
+        void settled.finally(() => {
+          if (manualCompaction?.controller === controller) manualCompaction = undefined
+        })
       })().catch((error: unknown) => {
         // Sync throws from compactNow (e.g. runMaintenance rejecting a
         // non-idle agent right after /resume) reject this IIFE itself;
@@ -5277,20 +5579,20 @@ export function createChannel(
         ...(renderedInstructions?.truncated ?? []).map(file => file.displayPath),
       ])
       files.push(...[...instructionPaths].map(displayPath => ({ displayPath })))
-      // The skills registry is host-plane but scope-layered: preset rows
-      // (skill-filesystem) register into the preset's layer, so the catalog
-      // must be read through the agent's scope chain (serviceForAgent falls
-      // back to the host context when no roster is mounted).
-      const skillsService = serviceForAgent<{
-        list(options?: unknown): Promise<readonly { name: string; description: string }[]>
-      }>(ctx, target, 'skills')
-      if (skillsService !== undefined) {
-        const catalog = await skillsService.list({})
+      // A registry entry reaches the model only through dsh-tool-skill's
+      // catalog, which is gated on that exact tool being visible to the agent.
+      const skillsRegistry = tools.some(tool => tool.name === 'skill')
+        ? skillRegistryFor(target)
+        : undefined
+      if (skillsRegistry !== undefined) {
+        const observation = await skillsRegistry.snapshot(skillViewOptions(target))
         if (target !== agent) return
-        skills.push(...catalog.map(skill => ({
-          name: skill.name,
-          description: skill.description,
-        })))
+        if (observation.complete) {
+          skills.push(...observation.skills.filter(isModelInvocable).map(skill => ({
+            name: skill.name,
+            description: skill.description,
+          })))
+        }
       }
     } catch (error) {
       ctx.logger.warn('loaded-context snapshot failed: %o', error)
@@ -5304,7 +5606,7 @@ export function createChannel(
    * Rebuild the merged slash-command list: built-in locals, then registry
    * commands (plan/goal/…), then user-invocable skills from the DSH skill
    * registry (issue #86 — filesystem-discovered skills must appear in the
-   * `/` menu and Tab completion, like /audit and /review). Skill entries
+   * `/` menu and Tab completion, like /my-skill). Skill entries
    * are completion-only: dispatch falls through to the model as plain text,
    * where dsh-tool-skill's pre-step hook injects the skill body — the same
    * path a hand-typed `/skill-name` takes. Registry and skill reads are
@@ -6575,16 +6877,64 @@ ${output}
     return rendered
   }
 
+  // Working Activity is an optional presentation sidecar. A malformed durable
+  // event must never let it abort the authoritative channel projection (Cordis
+  // contains the listener throw, but the rest of THIS callback would otherwise
+  // be skipped — including turn/end and inbox retirement).
+  let activityFailureReported = false
+  const updateWorkingActivity = (
+    source: string,
+    update?: () => void,
+  ): ActivityStatus | undefined => {
+    try {
+      update?.()
+      return renderWorkingActivity()
+    } catch (error: unknown) {
+      if (!activityFailureReported) {
+        activityFailureReported = true
+        const detail = error instanceof Error ? error.message : String(error)
+        ctx.logger.warn(`dsh-tui: working-activity ignored ${source} after a projection error: ${detail}`)
+      }
+      return undefined
+    }
+  }
+
+  /**
+   * Release volatile UI gates when the bound driver is definitively quiescent
+   * but its terminal session event did not reach this projection. This does not
+   * invent a turn/end or any transcript fact; it only reconciles live controls
+   * to the authoritative Agent status so Enter/Esc cannot remain latched.
+   */
+  const reconcileRetiredProjection = (status: 'idle' | 'disposed'): void => {
+    if (!state.working) return
+    ctx.logger.warn(
+      `dsh-tui: agent became ${status} while the channel still projected an open turn; releasing volatile UI gates`,
+    )
+    cancelInFlight = false
+    state.cancelPending = false
+    state.working = false
+    state.activeToolCount = 0
+    settleStreaming()
+    updateSpinnerMode()
+  }
+
   const bindAgent = (): void => {
+    agentBindingGeneration += 1
+    state.agentBindingGeneration = agentBindingGeneration
     for (const dispose of agentSubscriptions) dispose()
     stopActivityTick()
+    // Cancel state and deferred interrupt delivery belong to one bound agent.
+    // A replacement must neither inherit the old latch nor receive its queued
+    // microtask after the session identity changes.
+    cancelInFlight = false
+    interruptSeq += 1
     const prefs = activityPrefsSnapshot()
     activityTracker = new ActivityTracker(prefs.config, Date.now, prefs.customActions)
-    activityTracker.onAgentStatus(agent.status)
-    renderWorkingActivity()
+    activityFailureReported = false
+    updateWorkingActivity('agent bind', () => activityTracker.onAgentStatus(agent.status))
     activityTickTimer = setInterval(() => {
       const previous = state.workingActivity
-      const rendered = renderWorkingActivity()
+      const rendered = updateWorkingActivity('activity tick')
       if (rendered === undefined) return
       // Live phases deliberately wake at 500 ms even when the formatted line
       // has not crossed its next whole-second boundary: turnElapsedMs remains
@@ -6628,14 +6978,15 @@ ${output}
       ctx.on('agent/status', ({ agent: subject, status }) => {
         if (subject !== agent) return
         state.status = status
-        activityTracker.onAgentStatus(status)
-        renderWorkingActivity()
+        updateWorkingActivity(`agent/status:${status}`, () => activityTracker.onAgentStatus(status))
+        if (status === 'idle') reconcileRetiredProjection('idle')
         state.emit()
       }),
       ctx.on('agent/disposed', ({ agent: subject }) => {
         if (subject !== agent) return
         state.status = 'disposed'
         stopActivityTick()
+        reconcileRetiredProjection('disposed')
         state.emit()
       }),
       // Pending delivery is driven by the agent inbox: a claimed message
@@ -6663,9 +7014,16 @@ ${output}
         }
       })(),
       ctx.on('session/event', (session, event) => {
-        // First check if this is a subagent session
-        const subagentId = subagentStore.getSubagentIdBySession(session)
-        if (subagentId) {
+        // The currently bound main session always wins. SubagentActivityStore
+        // intentionally retains Session-object mappings for completed cards;
+        // if one of those sessions is later adopted/resumed as the main agent,
+        // checking the stale child mapping first would swallow every main event
+        // (including turn/end) and leave working/cancelPending latched forever.
+        const isMainSession = session === agent.session
+        const subagentId = isMainSession
+          ? undefined
+          : subagentStore.getSubagentIdBySession(session)
+        if (subagentId !== undefined) {
           subagentStore.onSessionEvent(subagentId, event)
           if (event.type === 'assistant/chunk') {
             // Token-rate path (100-300 events/s): the store append stays
@@ -6680,22 +7038,23 @@ ${output}
           }
           return
         }
-        // Otherwise handle main agent session
-        if (session !== agent.session) return
+        // Otherwise handle the bound main-agent session.
+        if (!isMainSession) return
         // Observation broker (C-042): maps user/message + assistant/message
         // into grant-gated envelopes; every other event type is a no-op, and
         // publish never throws into this arm.
         messageObserver?.publish(session, event)
-        activityTracker.onSessionEvent(event)
-        // Interrupt quip: an aborted/interrupted turn ends the round; the
-        // comeback copy shows on the next thinking rotation (pi parity).
-        if ((event as { type: string }).type === 'turn/end') {
-          const reason = (event.data as { reason?: { kind?: string } }).reason
-          if (reason?.kind === 'aborted' || reason?.kind === 'interrupted') {
-            activityTracker.onInterrupted()
+        updateWorkingActivity(`session/event:${event.type}`, () => {
+          activityTracker.onSessionEvent(event)
+          // Interrupt quip: an aborted/interrupted turn ends the round; the
+          // comeback copy shows on the next thinking rotation (pi parity).
+          if ((event as { type: string }).type === 'turn/end') {
+            const reason = (event.data as { reason?: { kind?: string } }).reason
+            if (reason?.kind === 'aborted' || reason?.kind === 'interrupted') {
+              activityTracker.onInterrupted()
+            }
           }
-        }
-        renderWorkingActivity()
+        })
         // Mode-affecting atoms fold into the Shift+Tab mode indicator the
         // moment they land (whether appended by cycleMode or by hand).
         const eventType = (event as { type: string }).type
@@ -6819,7 +7178,7 @@ ${output}
           // is exactly what the column claims.
           noteBranch(agent.session.id, branch)
           // Feed the working line so git tools can show ` · git <branch>`.
-          activityTracker.onGitBranch(branch)
+          updateWorkingActivity('git branch', () => activityTracker.onGitBranch(branch))
           state.emit()
         }
       })

@@ -15,6 +15,7 @@ import { actionMatches } from '../utils/keymap.js'
 import { formatTokens } from '../cc/format.js'
 import { homeDir } from '../utils/paths.js'
 import type { LlmModelInfo, LlmProviderInfo } from '../dsh-adapter/types.js'
+import { cleanRenderText, cleanScalarText } from '../dsh-adapter/sanitize.js'
 import {
   deriveModelGroups,
   modelPickerLanding,
@@ -22,11 +23,12 @@ import {
   RECENTS_GROUP_PROVIDER,
 } from '../modelGroups.js'
 import { readModelRecents, recordModelUse, type ModelRecentsRef } from '../modelRecents.js'
-import { sessionCwdMatches, type Channel, type ChatRow, type EffortOption, type PresetOption, type SkillInfo } from '../dsh-adapter/channel.js'
+import { sessionCwdMatches, type Channel, type ChatRow, type EffortOption, type PermissionPresetSnapshot, type PresetOption, type SkillInfo } from '../dsh-adapter/channel.js'
 import type { QuestionStore } from '../dsh-adapter/questions.js'
 import { TuiDialogStore } from '../dsh-adapter/dialogs.js'
 import { TuiStatusStore } from '../dsh-adapter/status.js'
 import type { TuiShortcutHost } from '../dsh-adapter/shortcuts.js'
+import type { TuiThemeHost } from '../dsh-adapter/themes.js'
 import type { TuiRewindMode } from '../dsh-adapter/extension-events.js'
 import { runProviderWizard } from '../dsh-adapter/providerWizard.js'
 import { ApprovalStore } from '../dsh-adapter/approvals.js'
@@ -46,7 +48,9 @@ import { ScrollbarGutter } from '../components/ScrollbarGutter.js'
 import type { TimelineSnapshot } from '../ink/timeline-rail.js'
 import { normalizeScrollGutter } from '../tuiDisplayPrefs.js'
 import { OverlayAbove } from '../components/OverlayAbove.js'
+import { TooltipLayer } from '../components/Tooltip.js'
 import { PromptInput, type PromptController } from '../components/PromptInput.js'
+import { PromptEditorLayer } from '../components/PromptEditor.js'
 import { GoalTodoPanel } from '../components/GoalTodoPanel.js'
 import { AutoRecapRow } from '../components/AutoRecapRow.js'
 import { BalanceReportRow } from '../components/BalanceReportRow.js'
@@ -69,7 +73,7 @@ import { ActivityPicker } from '../components/ActivityPicker.js'
 import { ColorPicker } from '../components/ColorPicker.js'
 import { EffortSlider } from '../components/EffortSlider.js'
 import { PresetPicker } from '../components/PresetPicker.js'
-import { PermissionsPicker, PERMISSION_PRESET_IDS } from '../components/PermissionsPicker.js'
+import { PermissionsPicker } from '../components/PermissionsPicker.js'
 import { PlanPicker } from '../components/PlanPicker.js'
 import { LangPicker } from '../components/LangPicker.js'
 import { ThemePicker, getThemeOptions } from '../components/ThemePicker.js'
@@ -86,7 +90,8 @@ import { SubagentDashboard } from '../components/SubagentDashboard.js'
 import { SubagentDetailScene } from '../components/SubagentDetailScene.js'
 import { FileActionsPanel, FILE_ACTION_COUNT } from '../components/FileActionsPanel.js'
 import { openExternal, openFile, revealInFileManager } from '../utils/openExternal.js'
-import { fileUrlToPath, parseFileLinkUrl, resolveTargetPath } from '../utils/fileTarget.js'
+import { resolveTargetPath } from '../utils/fileTarget.js'
+import { classifyOpenTarget } from '../utils/urlGuard.js'
 import { statSync } from 'node:fs'
 import { setClipboard } from '../ink/termio/osc.js'
 import { TerminalWriteContext } from '../ink/useTerminalNotification.js'
@@ -111,6 +116,29 @@ import {
 
 /** Shared empty snapshot for hosts whose channel has no event log. */
 const NO_EVENTS: readonly SessionEvent[] = []
+
+const PERMISSION_RESULT_CELLS = 200
+
+function cleanPermissionError(error: unknown): string {
+  try {
+    if (error instanceof Error) {
+      return typeof error.message === 'string'
+        ? cleanRenderText(error.message, PERMISSION_RESULT_CELLS)
+        : ''
+    }
+    return cleanScalarText(error, PERMISSION_RESULT_CELLS)
+  } catch {
+    return ''
+  }
+}
+
+function clonePermissionPresetSnapshot(snapshot: PermissionPresetSnapshot): PermissionPresetSnapshot {
+  return {
+    availability: snapshot.availability,
+    options: snapshot.options.map(option => ({ ...option })),
+    ...(snapshot.current === undefined ? {} : { current: { ...snapshot.current } }),
+  }
+}
 
 /** Row kinds the message-selection cursor can land on. */
 const SELECTABLE_KINDS = new Set<ChatRow['kind']>([
@@ -188,6 +216,7 @@ export function Chat({
   extensionDialogs,
   extensionStatus,
   extensionShortcuts,
+  themeHost,
   onExit,
   onUpdate,
   onRestart,
@@ -212,6 +241,8 @@ export function Chat({
   extensionStatus?: TuiStatusStore
   /** Host-only keyboard shortcut dispatch path. */
   extensionShortcuts?: TuiShortcutHost
+  /** Optional runtime theme host; static JSON themes work without it. */
+  themeHost?: TuiThemeHost
   onExit: () => void
   /** Update the installed package and restart the current TUI process. */
   onUpdate?: () => void
@@ -333,6 +364,20 @@ export function Chat({
    * list while the fresh one loads, exactly as the boolean era did.
    */
   const [overlay, dispatchOverlay] = React.useReducer(chatOverlayReducer, NO_OVERLAY)
+  // Chat and PromptInput both receive one parsed stdin batch. Keep the
+  // permission focus synchronous so arrow+Enter in the same batch uses the
+  // post-arrow row rather than the previous render's index.
+  const permissionOverlayFocusRef = React.useRef<{ overlay: unknown; index: number } | null>(null)
+  if (overlay.kind === 'permission') {
+    // Seed each concrete picker instance once. Subsequent renders from
+    // channel/store updates must not overwrite a focus change that has already
+    // been applied synchronously for an arrow+Enter batch.
+    if (permissionOverlayFocusRef.current?.overlay !== overlay) {
+      permissionOverlayFocusRef.current = { overlay, index: overlay.index }
+    }
+  } else {
+    permissionOverlayFocusRef.current = null
+  }
   const [models, setModels] = React.useState<readonly LlmModelInfo[]>([])
   /** Provider display identities for the /model group level; refreshed alongside `models`. */
   const [providerInfos, setProviderInfos] = React.useState<readonly LlmProviderInfo[]>([])
@@ -596,17 +641,18 @@ export function Chat({
   }, [])
 
   const handleOpenTarget = React.useCallback((url: string): void => {
-    const rawPath = parseFileLinkUrl(url)
-    if (rawPath !== undefined) {
-      openFileActions(rawPath)
+    const classification = classifyOpenTarget(url)
+    if (classification.kind === 'file-actions') {
+      openFileActions(classification.path)
       return
     }
-    const filePath = fileUrlToPath(url)
-    if (filePath !== undefined) {
-      openFileActions(filePath)
+    if (classification.kind === 'external') {
+      openExternal(url)
       return
     }
-    openExternal(url)
+    // Non-http(s) schemes from model/plugin-shaped links are not handed to
+    // the OS handler — see urlGuard.ts. Silently ignored: a toast needs
+    // channel state the Ink click path does not carry.
   }, [openFileActions])
 
   // Wire the click-to-open callback into the Ink instance (the field is
@@ -637,6 +683,10 @@ export function Chat({
   const isSticky = React.useSyncExternalStore(
     cb => (handle ? handle.subscribe(cb) : () => {}),
     () => (handle ? handle.isSticky() : true),
+  )
+  const subscribeTooltipInvalidation = React.useCallback(
+    (listener: () => void) => (handle ? handle.subscribe(listener) : () => {}),
+    [handle],
   )
 
   // "N new messages" pill: new rows whose top edge is still BELOW the
@@ -867,15 +917,22 @@ export function Chat({
    * result text lands as a notification. `rawInput` carries the text after
    * the command name (`/plan off` → ` off`).
    */
-  /** Localized display name of a sandbox mode id (`read-only` /
-   *  `workspace-write` / `danger-full-access`), for `/permission status`. */
-  const permissionPresetName = (id: string | undefined): string => {
-    switch (id) {
-      case 'read-only': return t('permission-preset-readonly')
-      case 'workspace-write': return t('permission-preset-workspace-write')
-      case 'danger-full-access': return t('permission-preset-full-access')
-      default: return id ?? '—'
-    }
+  /** Route every permission switch through the official command path. */
+  const runPermissionCommand = (rawInput: string): void => {
+    const originAgentBinding = channel.agentBindingGeneration
+    void channel.runExternalCommand('permission', rawInput).then((text) => {
+      if (channel.agentBindingGeneration !== originAgentBinding) return
+      if (text === undefined) {
+        channel.notify(t('command-not-found', { name: 'permission' }), { color: 'error' })
+        return
+      }
+      const cleaned = typeof text === 'string' ? cleanRenderText(text, PERMISSION_RESULT_CELLS) : ''
+      if (cleaned !== '') channel.notify(cleaned)
+    }).catch((error: unknown) => {
+      if (channel.agentBindingGeneration !== originAgentBinding) return
+      const detail = cleanPermissionError(error)
+      if (detail !== '') channel.notify(detail, { color: 'error' })
+    })
   }
 
   /** Hot-swap the UI language (`/lang <id>` and the LangPicker both land
@@ -1072,7 +1129,7 @@ export function Chat({
       }
       case 'theme': {
         // Bare `/theme` opens the interactive color picker (`auto` + built-in
-        // palettes + user themes from ~/.dsh-tui/themes); `/theme <name>`
+        // palettes + static/runtime themes); `/theme <name>`
         // switches directly; `/theme status` shows the current choice.
         // `auto` follows the terminal background (OSC 11). Selection
         // persists to ~/.dsh-tui/theme.json and hot swaps via the
@@ -1095,6 +1152,8 @@ export function Chat({
         }
         if (parts.length > 0) {
           setHelpOpen(false)
+          // setTheme rejects unknown names via isThemeAvailable, so pass the
+          // raw argument instead of resolving it against the catalog first.
           const ok = setTheme(parts[0])
           channel.notify(
             ok ? t('theme-switched-saved', { name: parts[0] }) : t('theme-unknown', { name: parts[0] }),
@@ -1107,7 +1166,7 @@ export function Chat({
           type: 'open',
           overlay: {
             kind: 'theme',
-            index: Math.max(0, getThemeOptions().findIndex(option => option.value === themeName)),
+            index: Math.max(0, getThemeOptions(themeHost).findIndex(option => option.value === themeName)),
           },
         })
         return true
@@ -1582,19 +1641,27 @@ export function Chat({
       case 'permission': {
         // The command itself is registered by dsh-sandbox-policy (dsh-base
         // permission-presets row): bare `/permission` opens the preset
-        // picker (read-only / workspace-write / danger-full-access) and
+        // picker and
         // Enter dispatches `/permission <preset>` through the same
         // external-command path a hand-typed argument takes. `/permission
-        // status` prints the policy explainer (absorbed from the removed
-        // `/permissions` command); other arguments pass through verbatim.
+        // status` prints the policy explainer; other arguments pass through
+        // verbatim.
         // When the row is not mounted the default external path (or the
         // model, when nothing is registered) wins.
         const mounted = channel.commandList.some(command => command.external && command.name === 'permission')
         const parts = rawInput.trim().split(/\s+/).filter(Boolean)
         if (mounted && parts[0] === 'status') {
           setHelpOpen(false)
+          const snapshot = channel.permissionPresets()
+          if (snapshot.options.some(option => option.value === 'status')) {
+            runPermissionCommand(rawInput)
+            return true
+          }
+          const currentName = snapshot.availability === 'unavailable'
+            ? t('permission-roster-unavailable')
+            : snapshot.current?.name ?? '—'
           channel.pushLocal('/permission', [
-            t('permission-current', { name: permissionPresetName(channel.mode.sandbox) }),
+            t('permission-current', { name: currentName }),
             t('permission-policy-hint'),
             t('permission-approval-hint'),
             t('permission-root-hint', { cwd: channel.cwd }),
@@ -1604,22 +1671,31 @@ export function Chat({
         }
         if (mounted && parts.length === 0) {
           setHelpOpen(false)
-          const index = (PERMISSION_PRESET_IDS as readonly string[]).indexOf(channel.mode.sandbox ?? '')
+          const snapshot = channel.permissionPresets()
+          if (snapshot.availability === 'unavailable' || snapshot.options.length === 0) {
+            runPermissionCommand(rawInput)
+            return true
+          }
+          const currentValue = snapshot.current?.kind === 'preset' ? snapshot.current.value : undefined
+          const currentIndex = currentValue === undefined
+            ? -1
+            : snapshot.options.findIndex(option => option.value === currentValue)
+          const index = currentIndex >= 0
+            ? currentIndex
+            : Math.min(1, snapshot.options.length - 1)
           dispatchOverlay({
             type: 'open',
-            overlay: { kind: 'permission', index: index >= 0 ? index : 1 },
+            overlay: {
+              kind: 'permission',
+              index,
+              snapshot: clonePermissionPresetSnapshot(snapshot),
+            },
           })
           return true
         }
         if (mounted) {
           setHelpOpen(false)
-          void channel.runExternalCommand('permission', rawInput).then((text) => {
-            if (text !== undefined && text !== '') {
-              channel.notify(text)
-            } else if (text === undefined) {
-              channel.notify(t('command-not-found', { name: 'permission' }), { color: 'error' })
-            }
-          })
+          runPermissionCommand(rawInput)
           return true
         }
         return false
@@ -1774,9 +1850,15 @@ export function Chat({
           onRestart()
         }
         return true
-      case 'vim':
-        channel.notify(t('vim-not-implemented'))
+      case 'vim': {
+        // `/vim`（CC vim 编辑模式）：切换输入框的 vim 编辑开关。状态在
+        // PromptInput 内部（controllerRef.toggleVim），每次切换落回 insert
+        // 子模式；Esc 进 normal、i/a/o 回 insert。会话级、不持久化。
+        setHelpOpen(false)
+        const on = promptControllerRef.current?.toggleVim() ?? false
+        channel.notify(t(on ? 'vim-on' : 'vim-off'))
         return true
+      }
       case 'terminal-setup':
         setHelpOpen(false)
         channel.pushLocal('/terminal-setup', [
@@ -2499,16 +2581,18 @@ export function Chat({
     }
     if (overlay.kind === 'permission') {
       if (key.upArrow || key.downArrow) {
-        dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: PERMISSION_PRESET_IDS.length })
+        const currentIndex = permissionOverlayFocusRef.current?.index ?? overlay.index
+        const nextIndex = wrapIndex(currentIndex, key.upArrow ? -1 : 1, overlay.snapshot.options.length)
+        permissionOverlayFocusRef.current = { overlay, index: nextIndex }
+        dispatchOverlay({ type: 'set-index', kind: 'permission', index: nextIndex })
       } else if (plainReturn) {
-        const id = PERMISSION_PRESET_IDS[overlay.index]
+        const currentIndex = permissionOverlayFocusRef.current?.index ?? overlay.index
+        const option = overlay.snapshot.options[currentIndex]
+        permissionOverlayFocusRef.current = null
         dispatchOverlay({ type: 'close' })
-        if (id !== undefined) {
-          void channel.runExternalCommand('permission', ` ${id}`).then((text) => {
-            if (text !== undefined && text !== '') channel.notify(text)
-          })
-        }
+        if (option !== undefined) runPermissionCommand(` ${option.value}`)
       } else if (key.escape) {
+        permissionOverlayFocusRef.current = null
         dispatchOverlay({ type: 'close' })
       }
       return
@@ -2540,7 +2624,7 @@ export function Chat({
       return
     }
     if (overlay.kind === 'theme') {
-      const options = getThemeOptions()
+      const options = getThemeOptions(themeHost)
       if (key.upArrow || key.downArrow) {
         dispatchOverlay({ type: 'move', delta: key.upArrow ? -1 : 1, count: options.length })
       } else if (plainReturn) {
@@ -2723,11 +2807,14 @@ export function Chat({
         setSelectionActive(false)
         setSelectedId(null)
       }
-    } else if (key.escape && channel.working && !helpOpen) {
+    } else if (key.escape && channel.working && !helpOpen && !promptControllerRef.current?.vimActive()) {
       // CC's chat:cancel — esc interrupts a running turn (the prompt input
       // only sees esc when idle, where it has the double-tap-clear meaning).
       // With messages queued for delivery, interrupt-and-deliver them right
       // away (Codex behavior); otherwise a plain interrupt parks the queue.
+      // vim mode (either submode) yields: there Esc is a MODE key (INSERT→
+      // NORMAL, NORMAL = no-op/cancel pending d) and the prompt owns it;
+      // interrupting still works via Ctrl+C / Ctrl+Enter.
       if (channel.pending.length > 0) {
         const count = channel.interruptAndDeliver(channel.pending.map(item => item.text))
         if (count > 0) {
@@ -2787,6 +2874,12 @@ export function Chat({
           exitPendingRef.current = false
           if (exitTimerRef.current) clearTimeout(exitTimerRef.current)
         }
+      } else if (input === 'c' && promptControllerRef.current?.consumeSelectionCopy()) {
+        // A mouse selection is active: Ctrl+C copies it to the clipboard
+        // (via the prompt controller — Chat's listener registers first) and
+        // KEEPS the selection for further editing. The key is consumed.
+        exitPendingRef.current = false
+        if (exitTimerRef.current) clearTimeout(exitTimerRef.current)
       } else if (input === 'c' && promptControllerRef.current?.hasText()) {
         promptControllerRef.current.clear()
         // A pending exit arm no longer makes sense once the user is editing.
@@ -3025,7 +3118,8 @@ export function Chat({
     workspaceTargetCount: workspaceTargets.length,
     effortOptionCount: effortOptions.length,
     presetOptionCount: presetOptions.length,
-  })
+  }) && !(overlay.kind === 'permission'
+    && (approvalSnapshot !== null || questionSnapshot !== null || dialogSnapshot !== null))
 
   // The sticky header pins the turn owning the viewport top row
   // (timeline.activeId, reported by MessageList) — scrolled up to an old
@@ -3494,20 +3588,18 @@ export function Chat({
               />
             </Box>
           )}
-          {overlay.kind === 'permission' && (
+          {overlay.kind === 'permission' && overlay.snapshot.options.length > 0 && (
             <Box flexDirection="column" marginTop={1}>
               <PermissionsPicker
+                options={overlay.snapshot.options}
                 focusIndex={overlay.index}
-                currentMode={channel.mode.sandbox}
+                currentValue={overlay.snapshot.current?.value}
                 cwd={channel.cwd}
                 onPick={(index) => {
+                  if (approvalSnapshot !== null || questionSnapshot !== null || dialogSnapshot !== null) return
+                  const option = overlay.snapshot.options[index]
                   dispatchOverlay({ type: 'close' })
-                  const id = PERMISSION_PRESET_IDS[index]
-                  if (id !== undefined) {
-                    void channel.runExternalCommand('permission', ` ${id}`).then((text) => {
-                      if (text !== undefined && text !== '') channel.notify(text)
-                    })
-                  }
+                  if (option !== undefined) runPermissionCommand(` ${option.value}`)
                 }}
               />
             </Box>
@@ -3546,9 +3638,10 @@ export function Chat({
               <ThemePicker
                 focusIndex={overlay.index}
                 currentTheme={themeName}
+                themeHost={themeHost}
                 onPick={(index) => {
                   dispatchOverlay({ type: 'close' })
-                  const name = getThemeOptions()[index]?.value
+                  const name = getThemeOptions(themeHost)[index]?.value
                   if (name !== undefined) {
                     const ok = setTheme(name)
                     channel.notify(
@@ -3629,6 +3722,19 @@ export function Chat({
         </OverlayAbove>
         )}
       </Box>
+      {/* Tooltip 悬停浮层：absolute 零布局高度，挂在根 Box 最后确保盖在
+          其余内容之上（yoga 的 absolute 相对父级，根 Box 原点即屏原点，
+          指针 anchor 的屏幕坐标可直接使用）。订阅模块级 store，锚点/
+          内容由各处的 useTooltip hover props 写入；resize 时自行隐藏
+          （几何失效）。 */}
+      <TooltipLayer
+        invalidationKey={`${overlay.kind}:${dialogOverlayOpen}:${btw !== null}`}
+        subscribeInvalidation={subscribeTooltipInvalidation}
+      />
+      {/* 全屏草稿编辑浮层：必须挂在 TooltipLayer 之后（树序最后），
+          才能盖住包括状态栏在内的全部后绘兄弟。内容由 PromptInput
+          经 module store 发布（见 PromptEditor.tsx）。 */}
+      <PromptEditorLayer />
     </Box>
   )
 }
