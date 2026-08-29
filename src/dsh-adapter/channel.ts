@@ -660,6 +660,9 @@ export interface Channel {
   readonly model: string
   /** Provider route of the live agent. */
   readonly provider: string
+  /** Model catalog display name for the status line, when the live route's
+   *  model carries one (falls back to the raw id otherwise). */
+  readonly modelName: string | undefined
   /** Raw cordis.yml `provider` key (undefined when unset) — the boot-time
    *  pin `/reload` must never override. */
   readonly configuredProvider: string | undefined
@@ -1123,6 +1126,8 @@ export interface ChannelState {
   agentBindingGeneration: number
   model: string
   provider: string
+  /** Model catalog display name for the StatusLine, when the route's model carries one. */
+  modelName: string | undefined
   tokens: TokenUsage
   cwd: string
   displayCwd: string
@@ -2312,6 +2317,29 @@ export function createChannel(
       })
   }
 
+  /** Best-effort resolution of the live route's display name from the model
+   *  catalog; the StatusLine shows it when available and falls back to the
+   *  raw model id otherwise. */
+  const refreshModelName = (): void => {
+    if (typeof state.listModels !== 'function') return
+    state
+      .listModels()
+      .then(list => {
+        const found = list.find(m => m.provider === state.provider && m.id === state.model)
+        // Normalize: an absent or empty catalog name clears the label so a
+        // removed `name` config falls back to the raw id on the next render.
+        const name = typeof found?.name === 'string' && found.name !== '' ? found.name : undefined
+        if (name !== state.modelName) {
+          state.modelName = name
+          state.emit()
+        }
+      })
+      .catch(() => {
+        // Best-effort: a catalog failure keeps the last known label (or the
+        // raw id when none was ever resolved) in the StatusLine.
+      })
+  }
+
   /** Resolve the live route's effort levels + adapter default through the
    *  llm runtime; 'unavailable' when the service is unmounted, 'error' when
    *  resolution throws (notified here). */
@@ -2791,6 +2819,7 @@ export function createChannel(
     agentBindingGeneration: 0,
     model: options.model,
     provider: options.provider,
+    modelName: undefined,
     tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, peak: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, idle: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
     cwd: options.cwd,
     displayCwd: workspaceService.describe(options.cwd).description ?? options.cwd,
@@ -4152,6 +4181,9 @@ export function createChannel(
       if (resumedRoute !== undefined) {
         state.provider = resumedRoute.provider
         state.model = resumedRoute.model
+        // Drop the previous route's display name immediately: the async
+        // catalog re-resolution below must not leave a stale label on screen.
+        state.modelName = undefined
       }
       state.tps = undefined
       state.tpsSamples = []
@@ -4321,6 +4353,9 @@ export function createChannel(
       state.agentPreset = newComposed.agentPreset
       state.model = route.model
       state.provider = route.provider
+      // Drop the previous route's display name immediately: the async
+      // catalog re-resolution below must not leave a stale label on screen.
+      state.modelName = undefined
       state.tps = undefined
       state.tpsSamples = []
       state.lastUsage = undefined
@@ -4515,6 +4550,9 @@ export function createChannel(
       state.agentPreset = modelComposed.agentPreset
       state.model = model
       state.provider = provider
+      // Drop the previous route's display name immediately: the async
+      // catalog re-resolution below must not leave a stale label on screen.
+      state.modelName = undefined
       // /model completion cache: the [current] tag was resolved at fetch
       // time — drop the cache so the next `/model ` refetches for the new
       // route.
@@ -6973,6 +7011,10 @@ ${output}
     }
     void applyPreferredEffort()
     refreshMode()
+    // Display-name refresh: the StatusLine shows the model's catalog name when
+    // available; every bind (create/resume/switch/new) re-resolves it so /model
+    // changes and resumed routes keep the label in sync.
+    refreshModelName()
     agentSubscriptions = [
       installModelSelection(agent.ctx, selection),
       ctx.on('agent/status', ({ agent: subject, status }) => {

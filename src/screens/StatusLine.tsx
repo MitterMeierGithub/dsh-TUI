@@ -271,7 +271,7 @@ export function StatusLine({
 
   const leftFields: FieldPart[] = [
     ...(statusBar.model
-      ? [{ key: 'model', node: <Text color="inactiveShimmer">{channel.model}</Text> }]
+      ? [{ key: 'model', node: <Text color="inactiveShimmer">{channel.modelName ?? channel.model}</Text> }]
       : []),
     ...(tpsPart !== undefined ? [tpsPart] : []),
     ...contextParts,
